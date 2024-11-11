@@ -1,0 +1,212 @@
+# azure-pipelines.yml
+
+pool:
+  vmImage: "windows-latest"
+
+trigger:
+  branches:
+    include:
+      - main # Trigger pipeline on changes to the main branch
+
+variables:
+  azureSubscription: "PartnerNetworkServiceConnection" # Replace with the name of Azure DevOps Service Connection
+  resourceGroupName: "bicep" # Your target resource group
+  location: "AustraliaEast" # Deployment region
+  templateFile: "main.bicep" # Path to your Bicep file
+  skipValidate: "false" # set to True to Skip
+  uniqueId: $[coalesce(variables['Build.BuildId'], variables['Build.RunId'], '00001')] # Fallback to ensure a unique ID
+  appServiceName: $[format('{0}-Service-{1}', variables['env'], variables['uniqueId'])] # Combine env and unique ID
+  secretValue: $(sqlAdminPasswordSecretName) # value to look for in the key vault
+  sqlAdminPasswordSecretName: "sqlAdminPassword"
+  env: "Dev" # the environment
+  keyVaultName: DevKeyVault123 # name of the Key vault we're going to use
+  keyVaultResourceGroup: Secure # name of the Resourse group the kevault resides in, (Probably not needed)
+  sqlAdminUsername: DevSqlAdmin # user name for the SQL server
+
+
+
+stages:
+  - stage: Validate
+    jobs:
+      - job: ValidateBicep
+        condition: eq(variables['skipValidate'], 'false')
+        displayName: "Validate Bicep Template"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Validate Bicep Syntax"
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az bicep build --file $(templateFile)
+
+  - stage: Deploy
+    dependsOn: Validate
+    jobs:
+      - job: DeployResources
+        displayName: "Deploy Resources"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureSubscription) # Replace with your Azure DevOps service connection name
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                # Retrieve the Role Definition ID for "Key Vault Secrets User"
+                (az role definition list --name "Key Vault Secrets User" --query "[].id" -o tsv).Split('/')[-1]
+                Write-Host "##vso[task.setvariable variable=RoleDefinitionId]$roleId"
+            displayName: "Retrieve Role Definition ID"
+
+          - task: AzureCLI@2
+            displayName: "Deploy Bicep Template"
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az deployment group create \
+                  --name "main-$(date +%Y%m%d%H%M%S)" \
+                  --resource-group $(resourceGroupName) \
+                  --template-file $(templateFile) \
+                  --mode complete \
+                  --parameters location=$(location) keyVaultName=$(keyVaultName) sqlAdminPasswordSecretName=$(sqlAdminPasswordSecretName) sqlAdminUsername=$(sqlAdminUsername) env=$(env) keyVaultResourceGroup=$(keyVaultResourceGroup) appServiceName=$(appServiceName) RoleDefinitionId=$(RoleDefinitionId)
+
+  - stage: TestIntegration
+    dependsOn: Deploy
+    jobs:
+      - job: DeployAppService
+        steps:
+          # Copy the PowerShell script to the staging directory
+          - task: CopyFiles@2
+            inputs:
+              SourceFolder: "$(System.DefaultWorkingDirectory)"
+              Contents: "TestSql.ps1"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+            displayName: "Copy PowerShell Script"
+
+            # Retrieve the SQL Server name from the most recent deployment output
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: ps
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Set resource group name
+                      $resourceGroupName = "$(resourceGroupName)"
+                      
+                      # Get the latest deployment name containing 'SQL'
+                      $deploymentName = az deployment group list --resource-group $resourceGroupName --query "[?contains(name, 'SQL')].[name]" -o tsv | Select-Object -First 1
+                      
+                      # Check if deployment name was retrieved
+                      if (-not $deploymentName) {
+                          Write-Error "No SQL-related deployment found in resource group $resourceGroupName."
+                          exit 1
+                      }
+
+                      # Retrieve SQL Server name output from the deployment
+                      $sqlServerName = az deployment group show --resource-group $resourceGroupName --name $deploymentName --query "properties.outputs.sqlServerName.value" -o tsv
+                      
+                      # Retrieve IP address from the first NIC in the resource group
+                      # $SqlServerIp = ((Get-AzNetworkInterface -ResourceGroupName $resourceGroupName | Select-Object -First 1).IpConfigurations | select -First 1).PrivateIpAddress 
+                      $SqlServerIp = az network nic list --resource-group $resourceGroupName --query "[?contains(name, 'dev-SQL')].ipConfigurations[0].privateIPAddress" -o tsv
+
+
+                      # Set pipeline variables with the retrieved values
+                      Write-Output "##vso[task.setvariable variable=sqlServerName]$sqlServerName"
+                      Write-Output "##vso[task.setvariable variable=SqlServerIp]$SqlServerIp"
+            displayName: "Get SQL Server Name from Deployment"
+
+          # Archive the PowerShell script for deployment
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: "$(Build.ArtifactStagingDirectory)"
+              includeRootFolder: false
+              archiveType: "zip"
+              archiveFile: "$(Build.ArtifactStagingDirectory)/script.zip"
+              replaceExistingArchive: true
+            displayName: "Archive PowerShell Script"
+
+          # Deploy the archived script to the Azure App Service
+          - task: AzureWebApp@1
+            inputs:
+              appName: $(appServiceName) # Uses the dynamically created app name
+              azureSubscription: $(azureSubscription)
+              appType: "webApp"
+              package: "$(Build.ArtifactStagingDirectory)/script.zip"
+            displayName: "Deploy PowerShell Script to Azure App Service"
+
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: $(azureSubscription)
+              KeyVaultName: $(keyVaultName) # Replace with your Key Vault name
+              SecretsFilter: $(sqlAdminPasswordSecretName) # Replace with the name of your secret
+              RunAsPreJob: true
+
+
+          # Execute the PowerShell script on the App Service using Kudu API
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: ps
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Define the necessary variables
+                $appServiceName = "$(appServiceName)" 
+                $resourceGroupName = "$(resourceGroupName)"
+
+                # Get the publish profile XML
+                $publishProfileXml = az webapp deployment list-publishing-profiles --name $appServiceName --resource-group $resourceGroupName --xml # --output tsv
+
+                # Parse the XML to get the userName and userPWD
+                [xml]$xmlDoc = $publishProfileXml
+                $publishProfile = $xmlDoc.publishData.publishProfile[0]
+                $kuduUser = $publishProfile.userName
+                $kuduPassword = $publishProfile.userPWD
+                
+                $sqlUsername = "$(sqlAdminUsername)@$(sqlServerName)"
+                $sqlPassword = az keyvault secret show --vault-name $(keyVaultName) --name "$(secretValue)" --query "value" -o tsv
+                # $SqlServerIp = "$(SqlServerIp)"
+                $SqlServerIp = az network nic list --resource-group $resourceGroupName --query "[?contains(name, 'dev-SQL')].ipConfigurations[0].privateIPAddress" -o tsv
+
+
+                # debug values
+                Write-Output "appServiceName:     $appServiceName"
+                Write-Output "resourceGroupName:  $resourceGroupName"
+                Write-Output "kuduUser:           $kuduUser"
+                Write-Output "kuduPassword:       XXX"
+                Write-Output "sqlUsername:        $sqlUsername"
+                Write-Output "sqlPassword:        XXX"
+                Write-Output "SqlServerIp:        $SqlServerIp"
+
+                # Construct the Kudu API URL
+                $kuduApiUrl = "https://$appServiceName.scm.azurewebsites.net/api/command"
+
+                # Create the authorization header
+                $encodedCredentials = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($kuduUser):$($kuduPassword)"))
+                $headers = @{
+                    Authorization = "Basic $encodedCredentials"
+                    "Content-Type" = "application/json"
+                }
+
+                # Define the command to run in the Kudu environment
+                $command = "powershell ./site/wwwroot/TestSql.ps1 -sqlUsername `"$sqlUsername`" -sqlPassword `"$sqlPassword`" -SqlServerIp `"$SqlServerIp`""
+
+
+                # Create the JSON payload
+                $body = @{
+                    command = $command
+                } | ConvertTo-Json
+
+                # Send the POST request to execute the command
+                $response = Invoke-RestMethod -Uri $kuduApiUrl -Method Post -Headers $headers -Body $body
+
+                # Output the response for debugging purposes
+                $response
+            displayName: "Run PowerShell Script on Azure App Service"
+
+  
